@@ -23,6 +23,7 @@ from grid_doctor.helpers import (
     coarsen_healpix,
     create_healpix_pyramid,
     get_latlon_resolution,
+    init_multiscale_store,
     init_pyramid_store,
     latlon_to_healpix_pyramid,
     resolution_to_healpix_level,
@@ -760,3 +761,88 @@ def test_save_pyramid_region_init_huge_finely_chunked(tmp_path):
     assert not [f for f in os.listdir(store / "t") if not f.startswith(".")], (
         "init must not write data"
     )
+
+
+class TestSavePyramidMultiscales:
+    def _make_pyramid_chunked_coord(self) -> dict[int, xr.Dataset]:
+        def _create_dataset(level: int) -> xr.Dataset:
+            lat = xr.DataArray(
+                np.random.randn(12 * (4**level)),
+                coords=[
+                    np.arange(12 * (4**level)),
+                ],
+                dims=[
+                    "cell",
+                ],
+            ).chunk({"cell": 12 * (4**level)})
+            static = xr.DataArray(
+                [1.0, 2.0],
+                coords=[
+                    [0, 1],
+                ],
+                dims=["level"],
+            ).chunk({"level": 2})
+
+            ds = xr.Dataset(
+                data_vars=dict(
+                    temp=(
+                        ["time", "level", "cell"],
+                        np.random.randn(4, 2, 12 * (4**level)),
+                    ),
+                    static=static,
+                ),
+                coords=dict(
+                    time=("time", range(4)),
+                    level=("level", range(2)),
+                    cell=("cell", range(12 * (4**level))),
+                    latitude=lat,
+                ),
+            )
+            ds["temp"] = ds.temp.chunk({"time": 2})
+            return ds
+
+        return {level: _create_dataset(level) for level in (0, 1)}
+
+    def test_save_pyramid_local_multiscales_regions(self, tmp_path):
+        pyramid = self._make_pyramid_chunked_coord()
+        zarr_store = tmp_path / "multi.zarr"
+        init_multiscale_store(
+            pyramid=pyramid,
+            path=str(zarr_store),
+            materialise=[
+                "static",
+            ],
+        )
+
+        dt = xr.open_datatree(zarr_store, chunks="auto")
+
+        print(f"[DEBUG] dt:\n{dt}")
+
+        ds0 = dt["/multiscales/level_0"]
+        ds1 = dt["/multiscales/level_1"]
+
+        print(f"[DEBUG] ds0:\n{ds0}")
+        print(f"[DEBUG] ds0 static:\n{ds0.static}")
+
+        xr.testing.assert_equal(ds0.coords, pyramid[0].coords)
+        xr.testing.assert_equal(ds1.coords, pyramid[1].coords)
+        assert list(ds0.data_vars) == ["static", "temp"]
+        assert list(ds1.data_vars) == ["static", "temp"]
+
+        assert ds0.static.chunksizes == pyramid[0].static.chunksizes
+        assert ds0.latitude.chunksizes == pyramid[0].latitude.chunksizes
+        assert ds1.static.chunksizes == pyramid[1].static.chunksizes
+        assert ds1.latitude.chunksizes == pyramid[1].latitude.chunksizes
+
+        # Confirm that the data is nan.
+        ds0t = ds0.temp.data.compute()
+        ds1t = ds1.temp.data.compute()
+        assert len(ds0t[~np.isnan(ds0t)]) == 0
+        assert len(ds1t[~np.isnan(ds1t)]) == 0
+
+        ds0stat = ds0.static.compute()
+        ds1stat = ds1.static.compute()
+        xr.testing.assert_equal(ds0stat, pyramid[0].static.compute())
+        xr.testing.assert_equal(ds1stat, pyramid[1].static.compute())
+
+        assert False
